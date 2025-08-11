@@ -37,6 +37,7 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.coroutines.core)
     api(libs.net.raphimc.minecraftauth)
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
     //implementation(libs.androidx.core.ktx)
 //    implementation(libs.androidx.lifecycle.runtime.ktx)
   //  implementation(libs.androidx.activity.compose)
