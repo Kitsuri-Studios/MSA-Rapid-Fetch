@@ -4,16 +4,43 @@ import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import net.lenni0451.commons.httpclient.HttpClient
 import net.raphimc.minecraftauth.MinecraftAuth
 import net.raphimc.minecraftauth.service.realms.BedrockRealmsService
 import net.raphimc.minecraftauth.service.realms.model.RealmsWorld
 import net.raphimc.minecraftauth.step.bedrock.session.StepFullBedrockSession
-import net.raphimc.minecraftauth.util.MicrosoftConstants
-import java.util.concurrent.CompletableFuture
 
 /**
- * Main entry point for FletchLink Core functionality, including Bedrock Realms operations
+ * **FletchLinkManager**
+ *
+ * The main controller for FletchLink Core’s interaction with
+ * **Minecraft Bedrock Realms**.
+ * It is responsible for:
+ *
+ * - Managing and validating the user’s saved Bedrock session
+ * - Authenticating the user via Microsoft/Xbox Live
+ * - Fetching Realms availability status
+ * - Listing all Realms worlds for the account
+ * - Joining, accepting invites, and leaving Realms
+ * - Refreshing sessions to prevent token expiry
+ *
+ *
+ * **Threading model:**
+ * All network calls are wrapped in `withContext(Dispatchers.IO)` to ensure
+ * they run on a background thread, avoiding UI freezes.
+ *
+ * @property context Application context for session persistence.
+ *
+ * **Example:**
+ * ```kotlin
+ * val manager = FletchLinkManager.getInstance(context)
+ * if (!manager.hasValidSession()) {
+ *     manager.startAuthFlow { status, session ->
+ *         if (status == AuthStatus.SUCCESS) {
+ *             println("Logged in as ${session?.mcChain?.displayName}")
+ *         }
+ *     }
+ * }
+ * ```
  */
 class FletchLinkManager private constructor(private val context: Context) {
 
@@ -23,11 +50,30 @@ class FletchLinkManager private constructor(private val context: Context) {
 
     companion object {
         private const val TAG = "FletchLinkManager"
-        private const val BEDROCK_VERSION = "1.21.30" // Adjust to the latest Bedrock version as needed
+        /**
+         * Update This When Needed
+         */
+        private const val BEDROCK_VERSION = "1.21.94"
 
         @Volatile
         private var INSTANCE: FletchLinkManager? = null
 
+        /**
+         * Retrieves the **singleton** instance of [FletchLinkManager].
+         *
+         * Why singleton?
+         * Realms operations rely on consistent session handling
+         * and HTTP client reuse. Using a singleton ensures we
+         * don’t create multiple managers that could overwrite or
+         * invalidate each other's session data.
+         *
+         * @param context Any Android `Context` — internally replaced with application context.
+         *
+         * **Example:**
+         * ```kotlin
+         * val manager = FletchLinkManager.getInstance(context)
+         * ```
+         */
         fun getInstance(context: Context): FletchLinkManager {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: FletchLinkManager(context.applicationContext).also { INSTANCE = it }
@@ -36,7 +82,24 @@ class FletchLinkManager private constructor(private val context: Context) {
     }
 
     /**
-     * Check if user has a valid session
+     * Checks if the current device has a valid, unexpired session
+     * with **Realms access tokens**.
+     *
+     * Internally:
+     * - Loads the saved session from `SessionManager`
+     * - Confirms it contains a valid Realms XSTS token
+     * - Ensures the token is not expired
+     *
+     * This method is useful before attempting any Realms operation
+     * so the app can trigger authentication only if required.
+     *
+     * @return `true` if a valid session exists; otherwise `false`.
+     *
+     * **Example:**
+     * ```kotlin
+     * val isValid = manager.hasValidSession()
+     * println("Session valid: $isValid")
+     * ```
      */
     suspend fun hasValidSession(): Boolean = withContext(Dispatchers.IO) {
         val session = sessionManager.loadSavedSession(httpClient)
@@ -44,21 +107,60 @@ class FletchLinkManager private constructor(private val context: Context) {
     }
 
     /**
-     * Get current session if valid, null otherwise
+     * Retrieves the **current saved session** from persistent storage.
+     *
+     * Does not validate expiration; use [hasValidSession] to check validity.
+     *
+     * @return [StepFullBedrockSession.FullBedrockSession] if saved, else `null`.
+     *
+     * **Example:**
+     * ```kotlin
+     * val session = manager.getCurrentSession()
+     * println(session?.mcChain?.displayName ?: "No session")
+     * ```
      */
     suspend fun getCurrentSession(): StepFullBedrockSession.FullBedrockSession? = withContext(Dispatchers.IO) {
         sessionManager.loadSavedSession(httpClient)
     }
 
     /**
-     * Start authentication flow
+     * Starts the Microsoft/Xbox Live authentication flow for Bedrock.
+     *
+     * The returned [AuthSession] handles:
+     * - Redirecting the user to Microsoft login
+     * - Receiving auth codes
+     * - Exchanging them for Xbox Live and Bedrock tokens
+     * - Saving the session
+     *
+     * @param callback Callback to receive authentication status and results.
+     * @return An [AuthSession] to control the login process.
+     *
+     * **Example:**
+     * ```kotlin
+     * manager.startAuthFlow { status, session ->
+     *     if (status == AuthStatus.SUCCESS) {
+     *         println("Welcome ${session?.mcChain?.displayName}")
+     *     }
+     * }
+     * ```
      */
     fun startAuthFlow(callback: AuthCallback): AuthSession {
         return AuthSession(httpClient, sessionManager, callback)
     }
 
     /**
-     * Clear saved session and cached user info
+     * Deletes any stored Bedrock session and clears cached user info.
+     *
+     * Call this when:
+     * - User logs out
+     * - Token refresh fails
+     * - You want to force re-authentication
+     *
+     * **Example:**
+     * ```kotlin
+     * manager.clearSession()
+     * println("Session cleared.")
+     * ```
      */
     fun clearSession() {
         sessionManager.deleteSession()
@@ -67,7 +169,22 @@ class FletchLinkManager private constructor(private val context: Context) {
     }
 
     /**
-     * Get user info from current session, using cache if available
+     * Gets basic user profile info for the currently authenticated session.
+     *
+     * This includes:
+     * - Player display name
+     * - UUID
+     * - Whether Realms access is available
+     *
+     * Uses a cached value if previously fetched to avoid extra network calls.
+     *
+     * @return [UserInfo] or `null` if no valid session exists.
+     *
+     * **Example:**
+     * ```kotlin
+     * val info = manager.getUserInfo()
+     * println("Name: ${info?.displayName}, UUID: ${info?.uuid}")
+     * ```
      */
     suspend fun getUserInfo(): UserInfo? = withContext(Dispatchers.IO) {
         if (cachedUserInfo != null) {
@@ -88,7 +205,17 @@ class FletchLinkManager private constructor(private val context: Context) {
     }
 
     /**
-     * Checks if Realms service is available
+     * Checks if the Minecraft Bedrock Realms service is currently available.
+     *
+     * Useful before attempting Realms operations to prevent wasted network calls.
+     *
+     * @return `true` if available, else `false`.
+     *
+     * **Example:**
+     * ```kotlin
+     * val available = manager.isRealmsAvailable()
+     * println("Realms online: $available")
+     * ```
      */
     suspend fun isRealmsAvailable(): Boolean = withContext(Dispatchers.IO) {
         try {
@@ -106,7 +233,19 @@ class FletchLinkManager private constructor(private val context: Context) {
     }
 
     /**
-     * Fetches the list of Realms worlds for the current session
+     * Fetches a list of all Realms worlds the user can access.
+     *
+     * This includes:
+     * - Realms the user owns
+     * - Realms the user was invited to
+     *
+     * @return List of [RealmsWorld] or `null` if fetching fails.
+     *
+     * **Example:**
+     * ```kotlin
+     * val worlds = manager.getRealmsWorlds()
+     * worlds?.forEach { println("Realm: ${it.name}") }
+     * ```
      */
     suspend fun getRealmsWorlds(): List<RealmsWorld>? = withContext(Dispatchers.IO) {
         try {
@@ -126,7 +265,20 @@ class FletchLinkManager private constructor(private val context: Context) {
     }
 
     /**
-     * Joins a specific Realms world and returns the server address
+     * Attempts to join a given Realm.
+     *
+     * - Rejects joining if the Realm is expired
+     * - Rejects joining if the Realm version is incompatible
+     * - Returns the server's connection address on success
+     *
+     * @param realm The [RealmsWorld] to join.
+     * @return The server address string, or `null` if joining fails.
+     *
+     * **Example:**
+     * ```kotlin
+     * val address = manager.joinRealm(realm)
+     * println("Joined at: $address")
+     * ```
      */
     suspend fun joinRealm(realm: RealmsWorld): String? = withContext(Dispatchers.IO) {
         try {
@@ -154,7 +306,16 @@ class FletchLinkManager private constructor(private val context: Context) {
     }
 
     /**
-     * Accepts an invite to a Realm using an invite code
+     * Accepts an invite to a Realm using an invite code.
+     *
+     * @param inviteCode The unique Realm invitation code.
+     * @return The joined [RealmsWorld] or `null` if acceptance fails.
+     *
+     * **Example:**
+     * ```kotlin
+     * val realm = manager.acceptRealmInvite("NcPbAMg8wSymui8")
+     * println("Joined realm: ${realm?.name}")
+     * ```
      */
     suspend fun acceptRealmInvite(inviteCode: String): RealmsWorld? = withContext(Dispatchers.IO) {
         try {
@@ -174,7 +335,16 @@ class FletchLinkManager private constructor(private val context: Context) {
     }
 
     /**
-     * Leaves an invited Realm
+     * Leaves a Realm the user was invited to.
+     *
+     * @param realm The target [RealmsWorld] to leave.
+     * @return `true` if leaving succeeded, `false` otherwise.
+     *
+     * **Example:**
+     * ```kotlin
+     * val success = manager.leaveRealm(realm)
+     * println("Left realm: $success")
+     * ```
      */
     suspend fun leaveRealm(realm: RealmsWorld): Boolean = withContext(Dispatchers.IO) {
         try {
@@ -194,7 +364,19 @@ class FletchLinkManager private constructor(private val context: Context) {
     }
 
     /**
-     * Refreshes the session and re-fetches the Realms worlds
+     * Refreshes the current session to renew expired tokens,
+     * then re-fetches the Realms world list.
+     *
+     * This ensures the user’s Realms list is always fetched with
+     * valid credentials, even if the original tokens expired.
+     *
+     * @return Updated list of [RealmsWorld] or `null` if refresh fails.
+     *
+     * **Example:**
+     * ```kotlin
+     * val refreshedWorlds = manager.refreshRealms()
+     * println("Fetched ${refreshedWorlds?.size ?: 0} worlds after refresh")
+     * ```
      */
     suspend fun refreshRealms(): List<RealmsWorld>? = withContext(Dispatchers.IO) {
         try {
@@ -221,7 +403,10 @@ class FletchLinkManager private constructor(private val context: Context) {
     }
 
     /**
-     * Creates a BedrockRealmsService instance for the given session
+     * Creates a [BedrockRealmsService] instance bound to a specific session.
+     *
+     * @param session The active authenticated Bedrock session.
+     * @return Configured [BedrockRealmsService] ready for Realms calls.
      */
     private fun createRealmsService(session: StepFullBedrockSession.FullBedrockSession): BedrockRealmsService {
         return BedrockRealmsService(httpClient, BEDROCK_VERSION, session.realmsXsts)
